@@ -61,6 +61,7 @@
   h2{font-size:11px;color:var(--dim);text-transform:uppercase;
      letter-spacing:.12em;margin:28px 0 4px}
   #result{display:none}
+  #laneT{display:none}
   #status{color:var(--dim);font-size:12px;min-height:18px;margin-bottom:14px}
   footer{margin-top:40px;color:var(--dim);font-size:11px;border-top:1px solid var(--line);
          padding-top:14px}
@@ -101,6 +102,8 @@ new version, see and hear exactly what changed.</p>
       <canvas id="wD" height="56"></canvas></div>
     <div id="cursor"></div>
   </div>
+  <div class="lane" id="laneT"><div class="lane-label">transform</div>
+    <canvas id="wT" height="72"></canvas></div>
   <div class="controls">
     <button id="playA">play A</button>
     <button id="playB">play B</button>
@@ -121,12 +124,18 @@ new version, see and hear exactly what changed.</p>
 <footer>
   audiodiff · MIT · <a href="https://github.com/sriharshakaramchati/audiodiff">source and CLI version on GitHub</a>
   · analysis: 48 log-spaced bands, blended L2 + cosine spectral distance,
-  median + MAD thresholding
+  median + MAD thresholding, global pitch shift and static effect response
+  recovered and reported rather than silently cancelled
 </footer>
 
 <script>
 "use strict";
 const SR = 22050, NFFT = 2048, HOP = 512, NBANDS = 48, WAVE_POINTS = 1600;
+// global-transform detection, identical to the CLI
+const PITCH_STEP = 0.05, PITCH_MAX = 12.0, PITCH_MIN_REPORT = 0.25,
+      PITCH_MIN_MARGIN = 1.02, PITCH_MIN_FIT = 0.30, FINE_PER_OCTAVE = 96,
+      GAIN_FLOOR_FRAC = 0.20, GAIN_MIN_VOTES = 8, EFFECT_POINTS = 200,
+      EFFECT_DB_CLIP = 24.0, EFFECT_DB_TOL = 1.5, EFFECT_MIN_FRAC = 0.10;
 
 // ------------------------------------------------ fft (iterative radix-2)
 function fft(re, im){
@@ -163,38 +172,235 @@ function bandEdges(sr){
   return edges;
 }
 
-function logBandEnergies(x, sr){
+// magnitude spectrogram, frequency-major: mag[k*nFrames+fr]
+function stftMag(x, sr){
   const nFrames = 1 + Math.max(0, Math.floor((x.length-NFFT)/HOP));
-  const edges = bandEdges(sr);
-  const binHz = sr/NFFT;
-  // precompute bin->band map
-  const bandOf = new Int16Array(NFFT/2+1).fill(-1);
-  const bandCount = new Float32Array(NBANDS);
-  for(let b=0;b<=NFFT/2;b++){
-    const f=b*binHz;
-    for(let k=0;k<NBANDS;k++){
-      if(f>=edges[k]&&f<edges[k+1]){bandOf[b]=k;bandCount[k]++;break;}
-    }
-  }
-  const out = new Float32Array(nFrames*NBANDS);
-  const re=new Float32Array(NFFT), im=new Float32Array(NFFT);
+  const nFreq = NFFT/2+1;
+  const freqs = new Float64Array(nFreq);
+  for(let k=0;k<nFreq;k++) freqs[k]=k*sr/NFFT;
   // scipy stft scaling: win.sum() normalization
   let winSum=0; for(let i=0;i<NFFT;i++) winSum+=HANN[i];
+  const mag = new Float32Array(nFreq*nFrames);
+  const re=new Float32Array(NFFT), im=new Float32Array(NFFT);
   for(let fr=0;fr<nFrames;fr++){
     const off=fr*HOP;
     for(let i=0;i<NFFT;i++){re[i]=x[off+i]*HANN[i]; im[i]=0;}
     fft(re,im);
-    const acc=new Float32Array(NBANDS);
-    for(let b=0;b<=NFFT/2;b++){
-      const k=bandOf[b];
-      if(k>=0) acc[k]+=Math.hypot(re[b],im[b])/winSum;
-    }
-    for(let k=0;k<NBANDS;k++){
-      const mean = bandCount[k]>0 ? acc[k]/bandCount[k] : 0;
-      out[fr*NBANDS+k]=Math.log1p(mean*100);
+    for(let k=0;k<nFreq;k++) mag[k*nFrames+fr]=Math.hypot(re[k],im[k])/winSum;
+  }
+  return {freqs, mag, nFreq, nFrames};
+}
+
+function trimFrames(S, n){
+  if(n>=S.nFrames) return S;
+  const out=new Float32Array(S.nFreq*n);
+  for(let i=0;i<S.nFreq;i++)
+    for(let fr=0;fr<n;fr++) out[i*n+fr]=S.mag[i*S.nFrames+fr];
+  return {freqs:S.freqs, mag:out, nFreq:S.nFreq, nFrames:n};
+}
+
+// average a magnitude spectrogram into log-spaced bands. works for any
+// ascending frequency axis, linear bins or log grid
+function bandsFromMag(S, sr){
+  const edges=bandEdges(sr);
+  const out=new Float32Array(S.nFrames*NBANDS);
+  for(let k=0;k<NBANDS;k++){
+    const sel=[];
+    for(let i=0;i<S.nFreq;i++)
+      if(S.freqs[i]>=edges[k]&&S.freqs[i]<edges[k+1]) sel.push(i);
+    if(!sel.length) continue;
+    for(let fr=0;fr<S.nFrames;fr++){
+      let s=0;
+      for(const i of sel) s+=S.mag[i*S.nFrames+fr];
+      out[fr*NBANDS+k]=Math.log1p(s/sel.length*100);
     }
   }
-  return {bands:out, nFrames};
+  return {bands:out, nFrames:S.nFrames};
+}
+
+function logBandEnergies(x, sr){ return bandsFromMag(stftMag(x,sr), sr); }
+
+// ------------------------------------------------ global transforms
+// leftmost index i with arr[i] >= v (numpy searchsorted, side='left')
+function searchLeft(arr, v){
+  let lo=0, hi=arr.length;
+  while(lo<hi){const m=(lo+hi)>>1; if(arr[m]<v) lo=m+1; else hi=m;}
+  return lo;
+}
+
+// index/weight pair for linearly resampling a spectrum from the ascending
+// axis srcF onto dstF (clamped at both ends)
+function interpWeights(srcF, dstF){
+  const n=srcF.length, m=dstF.length;
+  const idx=new Int32Array(m), w=new Float64Array(m);
+  for(let i=0;i<m;i++){
+    const d=Math.min(Math.max(dstF[i],srcF[0]),srcF[n-1]);
+    const j=Math.min(Math.max(searchLeft(srcF,d),1),n-1);
+    idx[i]=j;
+    w[i]=Math.min(Math.max((d-srcF[j-1])/Math.max(srcF[j]-srcF[j-1],1e-12),0),1);
+  }
+  return {idx,w};
+}
+
+function interpSpectra(S, dstF, iw){
+  const m=dstF.length, nf=S.nFrames, out=new Float32Array(m*nf);
+  for(let i=0;i<m;i++){
+    const a=(iw.idx[i]-1)*nf, b=iw.idx[i]*nf, wi=iw.w[i];
+    for(let fr=0;fr<nf;fr++) out[i*nf+fr]=S.mag[a+fr]*(1-wi)+S.mag[b+fr]*wi;
+  }
+  return {freqs:dstF, mag:out, nFreq:m, nFrames:nf};
+}
+
+function interpCurve(srcF, vals, dstF){
+  const iw=interpWeights(srcF,dstF), out=new Float64Array(dstF.length);
+  for(let i=0;i<dstF.length;i++)
+    out[i]=vals[iw.idx[i]-1]*(1-iw.w[i])+vals[iw.idx[i]]*iw.w[i];
+  return out;
+}
+
+function meanSpectrum(S){
+  const out=new Float64Array(S.nFreq);
+  for(let i=0;i<S.nFreq;i++){
+    let s=0;
+    for(let fr=0;fr<S.nFrames;fr++) s+=S.mag[i*S.nFrames+fr];
+    out[i]=s/S.nFrames;
+  }
+  return out;
+}
+
+// fine log-frequency grid, where a pitch shift is a pure translation
+function fineAxis(sr){
+  const lo=40, hi=sr/2*0.95;
+  const n=Math.round(Math.log2(hi/lo)*FINE_PER_OCTAVE)+1;
+  const out=new Float64Array(n);
+  for(let i=0;i<n;i++) out[i]=lo*Math.pow(2,i/FINE_PER_OCTAVE);
+  return out;
+}
+
+// global pitch shift of B relative to A, in semitones (positive: B is
+// higher). a pitch shift translates the spectrum along log frequency, so the
+// mean spectra are cross-correlated on a log axis. 0 when nothing to report
+function estimatePitchShift(SA, SB){
+  const freqs=SA.freqs, lo=60.0, hi=freqs[freqs.length-1]*0.9;
+  if(hi<=lo*2) return 0;
+  const n=Math.floor(Math.log2(hi/lo)*12.0/PITCH_STEP)+1;
+  const grid=new Float64Array(n);
+  for(let i=0;i<n;i++) grid[i]=lo*Math.pow(2,i*PITCH_STEP/12.0);
+  const sa=interpCurve(freqs,meanSpectrum(SA),grid);
+  const sb=interpCurve(freqs,meanSpectrum(SB),grid);
+  for(let i=0;i<n;i++){sa[i]=Math.log1p(sa[i]*100); sb[i]=Math.log1p(sb[i]*100);}
+  let ma=0,mb=0;
+  for(let i=0;i<n;i++){ma+=sa[i];mb+=sb[i];}
+  ma/=n; mb/=n;
+  // score every candidate shift by the correlation over its overlap only. a
+  // plain dot product would grow with overlap length and so always favour
+  // zero lag; normalizing per lag removes that bias.
+  const K=Math.floor(PITCH_MAX/PITCH_STEP);
+  let bestLag=0, bestFit=-1, flatFit=-1;
+  for(let lag=-K;lag<=K;lag++){
+    const len=n-Math.abs(lag);
+    if(len<n/2) continue;
+    const oa=lag>=0?0:-lag, ob=lag>=0?lag:0;
+    let ua=0, ub=0;
+    for(let i=0;i<len;i++){ua+=sa[oa+i];ub+=sb[ob+i];}
+    ua/=len; ub/=len;
+    let dot=0, na=0, nb=0;
+    for(let i=0;i<len;i++){
+      const u=sa[oa+i]-ua, v=sb[ob+i]-ub;
+      dot+=u*v; na+=u*u; nb+=v*v;
+    }
+    const den=Math.sqrt(na)*Math.sqrt(nb);
+    const fit=den>1e-12?dot/den:0;
+    if(lag===0) flatFit=fit;
+    if(fit>bestFit){bestLag=lag;bestFit=fit;}
+  }
+  const semitones=bestLag*PITCH_STEP;
+  if(Math.abs(semitones)<PITCH_MIN_REPORT||bestFit<PITCH_MIN_FIT) return 0;
+  if(bestFit<=flatFit*PITCH_MIN_MARGIN) return 0;
+  return semitones;
+}
+
+// median per-bin B/A magnitude ratio: the frequency response of whatever
+// static effect separates the two versions. a real edit moves a minority of
+// frames, so the median across the file sees past it
+function binGains(SA, SB){
+  const nf=SA.nFrames, g=new Float64Array(SA.nFreq);
+  const buf=new Float64Array(nf);
+  for(let i=0;i<SA.nFreq;i++){
+    const base=i*nf;
+    let mx=0;
+    for(let fr=0;fr<nf;fr++){const v=SA.mag[base+fr]; if(v>mx)mx=v;}
+    const gate=Math.max(GAIN_FLOOR_FRAC*mx,1e-6);
+    let k=0;
+    for(let fr=0;fr<nf;fr++){
+      const av=SA.mag[base+fr];
+      if(av>gate) buf[k++]=SB.mag[base+fr]/Math.max(av,1e-12);
+    }
+    if(k<GAIN_MIN_VOTES){g[i]=1;continue}
+    const v=median(buf.subarray(0,k));
+    g[i]=Number.isFinite(v)?v:1;
+  }
+  return g;
+}
+
+function scaleSpectra(S, g){
+  const out=new Float32Array(S.nFreq*S.nFrames);
+  for(let i=0;i<S.nFreq;i++)
+    for(let fr=0;fr<S.nFrames;fr++) out[i*S.nFrames+fr]=S.mag[i*S.nFrames+fr]*g[i];
+  return {freqs:S.freqs, mag:out, nFreq:S.nFreq, nFrames:S.nFrames};
+}
+
+// recover the static response per FFT bin and line A up with B
+function normalizeGainBins(SA, SB){
+  const g=binGains(SA,SB);
+  return {a:scaleSpectra(SA,g), b:SB, gain:g, gainHz:SA.freqs};
+}
+
+// same, on the fine log grid and after undoing a pitch shift: B is read at
+// freq * 2**(semitones/12) so its partials land on A's
+function normalizeGainFine(SA, SB, semitones, sr){
+  const axis=fineAxis(sr), freqs=SA.freqs, top=freqs[freqs.length-1];
+  const ratio=Math.pow(2,semitones/12.0);
+  const warped=new Float64Array(axis.length);
+  for(let i=0;i<axis.length;i++) warped[i]=axis[i]*ratio;
+  const fa=interpSpectra(SA,axis,interpWeights(freqs,axis));
+  const fb=interpSpectra(SB,axis,interpWeights(freqs,warped));
+  const g=binGains(fa,fb);
+  // a shift up walks the top of the axis past B's Nyquist, where there is no
+  // evidence either way: leave those points flat rather than inventing a
+  // response out of clamped edge bins
+  for(let i=0;i<axis.length;i++)
+    if(warped[i]>top||warped[i]<freqs[0]) g[i]=1;
+  return {a:scaleSpectra(fa,g), b:fb, gain:g, gainHz:axis};
+}
+
+// recovered gain curve as dB on a ~200 point log-frequency axis, plus
+// whether it is coloured enough to be worth reporting
+function effectResponse(gain, gainHz, sr){
+  const db=new Float64Array(gain.length);
+  for(let i=0;i<gain.length;i++)
+    db[i]=Math.min(Math.max(20*Math.log10(Math.max(gain[i],1e-6)),
+                            -EFFECT_DB_CLIP), EFFECT_DB_CLIP);
+  const lo=40, hi=sr/2*0.95, axis=new Float64Array(EFFECT_POINTS);
+  for(let i=0;i<EFFECT_POINTS;i++)
+    axis[i]=lo*Math.pow(hi/lo,i/(EFFECT_POINTS-1));
+  const half=0.5*Math.log(axis[EFFECT_POINTS-1]/axis[0])/(EFFECT_POINTS-1);
+  const iw=interpWeights(gainHz,axis);
+  const curve=new Float64Array(EFFECT_POINTS);
+  let off=0;
+  for(let i=0;i<EFFECT_POINTS;i++){
+    // average the native-resolution response over each log cell; where a cell
+    // falls between source bins, interpolate instead
+    const f0=axis[i]*Math.exp(-half), f1=axis[i]*Math.exp(half);
+    let s=0, c=0;
+    for(let j=0;j<gainHz.length;j++)
+      if(gainHz[j]>=f0&&gainHz[j]<f1){s+=db[j];c++;}
+    curve[i]=c?s/c:db[iw.idx[i]-1]*(1-iw.w[i])+db[iw.idx[i]]*iw.w[i];
+    if(Math.abs(curve[i])>EFFECT_DB_TOL) off++;
+  }
+  return {db:Array.from(curve,v=>+v.toFixed(2)),
+          hz:Array.from(axis,v=>+v.toFixed(1)),
+          detected: off/EFFECT_POINTS > EFFECT_MIN_FRAC};
 }
 
 function spectralDistance(A, B){
@@ -327,7 +533,20 @@ $('run').onclick=async()=>{
     const b=await loadMono(fileB,setStatus);
     setStatus('analyzing ...');
     await new Promise(r=>setTimeout(r,30)); // let status paint
-    const A=logBandEnergies(a,SR), B=logBandEnergies(b,SR);
+    let SA=stftMag(a,SR), SB=stftMag(b,SR);
+    const nf=Math.min(SA.nFrames,SB.nFrames);
+    SA=trimFrames(SA,nf); SB=trimFrames(SB,nf);
+
+    // measure the global transform separating the two versions, then report it
+    const semitones=estimatePitchShift(SA,SB);
+    const norm = semitones ? normalizeGainFine(SA,SB,semitones,SR)
+                           : normalizeGainBins(SA,SB);
+    const eff=effectResponse(norm.gain,norm.gainHz,SR);
+
+    // only compensate when there is something to compensate, so an untouched
+    // pair diffs exactly as it would have without this stage
+    const A = (semitones||eff.detected) ? bandsFromMag(norm.a,SR) : bandsFromMag(SA,SR);
+    const B = (semitones||eff.detected) ? bandsFromMag(norm.b,SR) : bandsFromMag(SB,SR);
     const dist=spectralDistance(A,B);
     const {regions,thr}=findRegions(dist,SR);
     const durS=Math.min(a.length,b.length)/SR;
@@ -341,11 +560,15 @@ $('run').onclick=async()=>{
     D={nameA:fileA.name,nameB:fileB.name,dur:durS,
        envA:peakEnvelope(a.subarray(0,Math.floor(durS*SR))),
        envB:peakEnvelope(b.subarray(0,Math.floor(durS*SR))),
-       dist:dn,regions};
+       dist:dn,regions,
+       pitch:+semitones.toFixed(2),effect:eff.detected,
+       effectDb:eff.detected?eff.db:[],effectHz:eff.detected?eff.hz:[]};
     $('audA').src=URL.createObjectURL(fileA);
     $('audB').src=URL.createObjectURL(fileB);
     renderReport();
-    setStatus(`done · ${regions.length} changed region${regions.length===1?'':'s'}`);
+    setStatus(`done · ${regions.length} changed region${regions.length===1?'':'s'}`+
+      (D.pitch?` · pitch shift ${D.pitch>0?'+':''}${D.pitch} st`:'')+
+      (D.effect?' · static effect detected':''));
   }catch(err){
     setStatus('error: '+err.message+' (is this a supported audio format?)');
   }
@@ -387,6 +610,50 @@ function drawDiff(){
     ctx.fillRect(x,H*(1-v),w,H*v);
   }
 }
+// recovered response of the detected global effect, dB against log frequency
+function drawTransform(){
+  const c=$('wT'), r=c.getBoundingClientRect();
+  c.width=r.width*dpr; c.height=c.getAttribute('height')*dpr;
+  const ctx=c.getContext('2d'); ctx.scale(dpr,dpr);
+  const W=r.width, H=+c.getAttribute('height');
+  const db=D.effectDb, hz=D.effectHz, n=db.length;
+  const cs=getComputedStyle(document.documentElement);
+  const line=cs.getPropertyValue('--line').trim();
+  const dim=cs.getPropertyValue('--dim').trim();
+  const hot=cs.getPropertyValue('--hot').trim();
+  const soft=cs.getPropertyValue('--hot-soft').trim();
+  const mono=cs.getPropertyValue('--mono').trim();
+  const pad=14;
+  let span=6;
+  for(const v of db) span=Math.max(span,Math.ceil(Math.abs(v)));
+  const X=i=>i/(n-1)*W, Y=v=>pad+(0.5-v/(2*span))*(H-2*pad);
+  // log-frequency gridlines
+  ctx.font='9px '+mono; ctx.textBaseline='alphabetic';
+  const lr=Math.log(hz[n-1]/hz[0]);
+  for(const f of [100,1000,10000]){
+    if(f<hz[0]||f>hz[n-1]) continue;
+    const x=Math.log(f/hz[0])/lr*W;
+    ctx.strokeStyle=line; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke();
+    ctx.fillStyle=dim;
+    ctx.fillText(f>=1000?(f/1000)+'k':''+f, x+3, H-5);
+  }
+  // 0 dB reference and scale
+  ctx.strokeStyle=line; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(0,Y(0)); ctx.lineTo(W,Y(0)); ctx.stroke();
+  ctx.fillStyle=dim; ctx.textAlign='right';
+  ctx.fillText('+'+span+' dB', W-6, Y(span)+8);
+  ctx.fillText('-'+span+' dB', W-6, Y(-span)-3);
+  ctx.textAlign='left';
+  // curve, with the deviation from flat shaded in
+  ctx.beginPath(); ctx.moveTo(X(0),Y(0));
+  for(let i=0;i<n;i++) ctx.lineTo(X(i),Y(db[i]));
+  ctx.lineTo(X(n-1),Y(0)); ctx.closePath();
+  ctx.fillStyle=soft; ctx.fill();
+  ctx.beginPath();
+  for(let i=0;i<n;i++){const x=X(i),y=Y(db[i]); i?ctx.lineTo(x,y):ctx.moveTo(x,y);}
+  ctx.strokeStyle=hot; ctx.lineWidth=1.5; ctx.stroke();
+}
 function renderReport(){
   $('result').style.display='block';
   $('labA').textContent=D.nameA; $('labB').textContent=D.nameB;
@@ -394,6 +661,8 @@ function renderReport(){
   drawWave('wA',D.envA,cs.getPropertyValue('--wave-a'));
   drawWave('wB',D.envB,cs.getPropertyValue('--wave-b'));
   drawDiff();
+  $('laneT').style.display = D.effect ? 'block' : 'none';
+  if(D.effect) drawTransform();
   const tb=document.querySelector('#tbl tbody');
   tb.innerHTML='';
   if(D.regions.length===0)
