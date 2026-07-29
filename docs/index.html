@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>audiodiff</title>
+<style>
+  :root{
+    --bg:#101318; --panel:#171b22; --line:#232935;
+    --txt:#c8cdd8; --dim:#6b7484;
+    --wave-a:#5b8dbe; --wave-b:#4fae8d;
+    --hot:#e0603a; --hot-soft:rgba(224,96,58,.16);
+    --mono:'SF Mono',ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--txt);font-family:var(--mono);
+       font-size:13px;line-height:1.5;padding:32px 28px 64px;max-width:1100px;margin:0 auto}
+  header{display:flex;justify-content:space-between;align-items:baseline;
+         border-bottom:1px solid var(--line);padding-bottom:14px;margin-bottom:22px}
+  h1{font-size:15px;font-weight:600;letter-spacing:.04em}
+  h1 span{color:var(--hot)}
+  .meta{color:var(--dim);font-size:11px;text-align:right}
+  .tagline{color:var(--dim);font-size:12px;margin-bottom:22px}
+  .drops{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+  .drop{border:1px dashed var(--line);border-radius:6px;padding:26px 16px;
+        text-align:center;cursor:pointer;background:var(--panel)}
+  .drop:hover,.drop.over{border-color:var(--dim)}
+  .drop.loaded{border-style:solid;border-color:var(--wave-a)}
+  .drop.b.loaded{border-color:var(--wave-b)}
+  .drop .slot{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}
+  .drop .fname{margin-top:6px;word-break:break-all}
+  #run{width:100%;margin-bottom:26px}
+  button{background:var(--panel);border:1px solid var(--line);color:var(--txt);
+         font-family:var(--mono);font-size:12px;padding:9px 14px;border-radius:5px;
+         cursor:pointer}
+  button:hover:not(:disabled){border-color:var(--dim)}
+  button:disabled{opacity:.4;cursor:default}
+  button:focus-visible{outline:2px solid var(--wave-a);outline-offset:2px}
+  button.active{border-color:var(--hot);color:var(--hot)}
+  .lane{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+        margin-bottom:10px;position:relative;overflow:hidden}
+  .lane-label{position:absolute;top:6px;left:10px;font-size:10px;
+              color:var(--dim);letter-spacing:.08em;text-transform:uppercase;
+              z-index:3;pointer-events:none}
+  .lane-label b{color:var(--txt);font-weight:600}
+  canvas{display:block;width:100%}
+  #cursor{position:absolute;top:0;bottom:0;width:1px;background:#fff;
+          opacity:.7;pointer-events:none;z-index:4;display:none}
+  #timeline{position:relative}
+  .controls{display:flex;gap:8px;align-items:center;margin:16px 0 26px;flex-wrap:wrap}
+  .hint{color:var(--dim);font-size:11px;margin-left:auto}
+  table{width:100%;border-collapse:collapse;margin-top:10px}
+  th{color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.1em;
+     text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+  td{padding:9px 10px;border-bottom:1px solid var(--line);font-size:12px}
+  tr.region{cursor:pointer}
+  tr.region:hover td{background:var(--hot-soft)}
+  .sev{display:inline-block;height:8px;border-radius:2px;background:var(--hot);
+       vertical-align:middle}
+  .none{color:var(--dim);padding:20px 10px}
+  h2{font-size:11px;color:var(--dim);text-transform:uppercase;
+     letter-spacing:.12em;margin:28px 0 4px}
+  #result{display:none}
+  #status{color:var(--dim);font-size:12px;min-height:18px;margin-bottom:14px}
+  footer{margin-top:40px;color:var(--dim);font-size:11px;border-top:1px solid var(--line);
+         padding-top:14px}
+  footer a{color:var(--wave-a)}
+  input[type=file]{display:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>audio<span>diff</span></h1>
+  <div class="meta">runs in your browser · files never leave your machine</div>
+</header>
+<p class="tagline">Perceptual diff for two versions of a track. Drop the old and
+new version, see and hear exactly what changed.</p>
+
+<div class="drops">
+  <div class="drop a" id="dropA">
+    <div class="slot">A · old version</div>
+    <div class="fname" id="fnameA">click or drop audio file</div>
+    <input type="file" id="fileA" accept="audio/*">
+  </div>
+  <div class="drop b" id="dropB">
+    <div class="slot">B · new version</div>
+    <div class="fname" id="fnameB">click or drop audio file</div>
+    <input type="file" id="fileB" accept="audio/*">
+  </div>
+</div>
+<button id="run" disabled>diff</button>
+<div id="status"></div>
+
+<div id="result">
+  <div id="timeline">
+    <div class="lane"><div class="lane-label">A · <b id="labA"></b></div>
+      <canvas id="wA" height="110"></canvas></div>
+    <div class="lane"><div class="lane-label">B · <b id="labB"></b></div>
+      <canvas id="wB" height="110"></canvas></div>
+    <div class="lane"><div class="lane-label">diff</div>
+      <canvas id="wD" height="56"></canvas></div>
+    <div id="cursor"></div>
+  </div>
+  <div class="controls">
+    <button id="playA">play A</button>
+    <button id="playB">play B</button>
+    <button id="stop">stop</button>
+    <span class="hint">click a lane to seek · click a region row to loop it · A/B switches source at same position</span>
+  </div>
+  <h2>changed regions</h2>
+  <table id="tbl">
+    <thead><tr><th>#</th><th>start</th><th>end</th><th>length</th>
+    <th>severity</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<audio id="audA"></audio>
+<audio id="audB"></audio>
+
+<footer>
+  audiodiff · MIT · <a href="https://github.com/sriharshakaramchati/audiodiff">source and CLI version on GitHub</a>
+  · analysis: 48 log-spaced bands, blended L2 + cosine spectral distance,
+  median + MAD thresholding
+</footer>
+
+<script>
+"use strict";
+const SR = 22050, NFFT = 2048, HOP = 512, NBANDS = 48, WAVE_POINTS = 1600;
+
+// ------------------------------------------------ fft (iterative radix-2)
+function fft(re, im){
+  const n = re.length;
+  for(let i=1,j=0;i<n;i++){
+    let bit=n>>1;
+    for(;j&bit;bit>>=1) j^=bit;
+    j^=bit;
+    if(i<j){[re[i],re[j]]=[re[j],re[i]];[im[i],im[j]]=[im[j],im[i]];}
+  }
+  for(let len=2;len<=n;len<<=1){
+    const ang=-2*Math.PI/len, wr=Math.cos(ang), wi=Math.sin(ang);
+    for(let i=0;i<n;i+=len){
+      let cr=1, ci=0;
+      for(let k=0;k<len/2;k++){
+        const ur=re[i+k], ui=im[i+k];
+        const vr=re[i+k+len/2]*cr - im[i+k+len/2]*ci;
+        const vi=re[i+k+len/2]*ci + im[i+k+len/2]*cr;
+        re[i+k]=ur+vr; im[i+k]=ui+vi;
+        re[i+k+len/2]=ur-vr; im[i+k+len/2]=ui-vi;
+        const ncr=cr*wr-ci*wi; ci=cr*wi+ci*wr; cr=ncr;
+      }
+    }
+  }
+}
+
+const HANN = new Float32Array(NFFT);
+for(let i=0;i<NFFT;i++) HANN[i]=0.5*(1-Math.cos(2*Math.PI*i/(NFFT-1)));
+
+// ------------------------------------------------ analysis
+function bandEdges(sr){
+  const lo=40, hi=sr/2*0.95, edges=[];
+  for(let i=0;i<=NBANDS;i++) edges.push(lo*Math.pow(hi/lo,i/NBANDS));
+  return edges;
+}
+
+function logBandEnergies(x, sr){
+  const nFrames = 1 + Math.max(0, Math.floor((x.length-NFFT)/HOP));
+  const edges = bandEdges(sr);
+  const binHz = sr/NFFT;
+  // precompute bin->band map
+  const bandOf = new Int16Array(NFFT/2+1).fill(-1);
+  const bandCount = new Float32Array(NBANDS);
+  for(let b=0;b<=NFFT/2;b++){
+    const f=b*binHz;
+    for(let k=0;k<NBANDS;k++){
+      if(f>=edges[k]&&f<edges[k+1]){bandOf[b]=k;bandCount[k]++;break;}
+    }
+  }
+  const out = new Float32Array(nFrames*NBANDS);
+  const re=new Float32Array(NFFT), im=new Float32Array(NFFT);
+  // scipy stft scaling: win.sum() normalization
+  let winSum=0; for(let i=0;i<NFFT;i++) winSum+=HANN[i];
+  for(let fr=0;fr<nFrames;fr++){
+    const off=fr*HOP;
+    for(let i=0;i<NFFT;i++){re[i]=x[off+i]*HANN[i]; im[i]=0;}
+    fft(re,im);
+    const acc=new Float32Array(NBANDS);
+    for(let b=0;b<=NFFT/2;b++){
+      const k=bandOf[b];
+      if(k>=0) acc[k]+=Math.hypot(re[b],im[b])/winSum;
+    }
+    for(let k=0;k<NBANDS;k++){
+      const mean = bandCount[k]>0 ? acc[k]/bandCount[k] : 0;
+      out[fr*NBANDS+k]=Math.log1p(mean*100);
+    }
+  }
+  return {bands:out, nFrames};
+}
+
+function spectralDistance(A, B){
+  const n=Math.min(A.nFrames,B.nFrames);
+  const d=new Float32Array(n);
+  for(let f=0;f<n;f++){
+    let l2=0,na=0,nb=0,dot=0;
+    for(let k=0;k<NBANDS;k++){
+      const a=A.bands[f*NBANDS+k], b=B.bands[f*NBANDS+k];
+      const df=a-b; l2+=df*df; na+=a*a; nb+=b*b; dot+=a*b;
+    }
+    l2=Math.sqrt(l2); na=Math.sqrt(na); nb=Math.sqrt(nb);
+    const l2n=l2/(na+nb+1e-6);
+    const cos=Math.max(-1,Math.min(1,dot/((na*nb)+1e-6)));
+    d[f]=0.6*l2n+0.4*(1-cos);
+  }
+  // smooth ~0.25s with hann kernel, same as CLI
+  const k=Math.max(1,Math.floor(0.25*SR/HOP));
+  const kern=new Float32Array(2*k+1);
+  let ks=0;
+  for(let i=0;i<kern.length;i++){kern[i]=0.5*(1-Math.cos(2*Math.PI*i/(kern.length-1)));ks+=kern[i];}
+  const sm=new Float32Array(n);
+  for(let i=0;i<n;i++){
+    let s=0;
+    for(let j=-k;j<=k;j++){
+      const ii=i+j;
+      if(ii>=0&&ii<n) s+=d[ii]*kern[j+k];
+    }
+    sm[i]=s/ks;
+  }
+  return sm;
+}
+
+function median(arr){
+  const s=Array.from(arr).sort((a,b)=>a-b);
+  const m=s.length>>1;
+  return s.length%2?s[m]:(s[m-1]+s[m])/2;
+}
+
+function findRegions(dist, sr){
+  const frameT=HOP/sr;
+  const med=median(dist);
+  const dev=dist.map(v=>Math.abs(v-med));
+  const mad=median(dev)+1e-6;
+  const thr=Math.max(med+4*mad, 0.06);
+  const minDur=0.35, gap=0.9;
+  const raw=[];
+  let start=null;
+  for(let i=0;i<dist.length;i++){
+    const hot=dist[i]>thr;
+    if(hot&&start===null) start=i;
+    else if(!hot&&start!==null){raw.push([start,i]);start=null;}
+  }
+  if(start!==null) raw.push([start,dist.length]);
+  const merged=[];
+  for(const [s,e] of raw){
+    if(merged.length && s*frameT-(merged[merged.length-1][1]-1)*frameT<gap)
+      merged[merged.length-1][1]=e;
+    else merged.push([s,e]);
+  }
+  const out=[];
+  for(const [s,e] of merged){
+    const t0=s*frameT, t1=Math.min(e,dist.length-1)*frameT;
+    if(t1-t0>=minDur){
+      let peak=0,sum=0;
+      for(let i=s;i<e;i++){peak=Math.max(peak,dist[i]);sum+=dist[i];}
+      out.push({start:+t0.toFixed(2),end:+t1.toFixed(2),
+                peak:+peak.toFixed(3),mean:+(sum/(e-s)).toFixed(3)});
+    }
+  }
+  return {regions:out, thr};
+}
+
+// ------------------------------------------------ io
+async function loadMono(file, status){
+  status(`decoding ${file.name} ...`);
+  const buf=await file.arrayBuffer();
+  const probe=new (window.AudioContext||window.webkitAudioContext)();
+  const decoded=await probe.decodeAudioData(buf);
+  probe.close();
+  const frames=Math.ceil(decoded.duration*SR);
+  const oc=new OfflineAudioContext(1, frames, SR);
+  const src=oc.createBufferSource();
+  src.buffer=decoded;
+  src.connect(oc.destination);
+  src.start();
+  const rendered=await oc.startRendering();
+  return rendered.getChannelData(0);
+}
+
+function peakEnvelope(x){
+  const step=Math.max(1,Math.floor(x.length/WAVE_POINTS));
+  const out=new Float32Array(WAVE_POINTS);
+  for(let i=0;i<WAVE_POINTS;i++){
+    let p=0;
+    const s=i*step, e=Math.min(s+step,x.length);
+    for(let j=s;j<e;j++){const v=Math.abs(x[j]); if(v>p)p=v;}
+    out[i]=p;
+  }
+  return out;
+}
+
+// ------------------------------------------------ ui
+let fileA=null, fileB=null, D=null;
+const $=id=>document.getElementById(id);
+const statusEl=$('status');
+const setStatus=t=>statusEl.textContent=t;
+
+function wireDrop(dropId, inputId, fnameId, setFile){
+  const drop=$(dropId), input=$(inputId);
+  drop.onclick=()=>input.click();
+  input.onchange=()=>{if(input.files[0]) setFile(input.files[0]);};
+  drop.ondragover=e=>{e.preventDefault();drop.classList.add('over');};
+  drop.ondragleave=()=>drop.classList.remove('over');
+  drop.ondrop=e=>{
+    e.preventDefault();drop.classList.remove('over');
+    if(e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
+  };
+}
+wireDrop('dropA','fileA','fnameA',f=>{fileA=f;$('fnameA').textContent=f.name;
+  $('dropA').classList.add('loaded');ready();});
+wireDrop('dropB','fileB','fnameB',f=>{fileB=f;$('fnameB').textContent=f.name;
+  $('dropB').classList.add('loaded');ready();});
+function ready(){$('run').disabled=!(fileA&&fileB);}
+
+$('run').onclick=async()=>{
+  $('run').disabled=true;
+  try{
+    const a=await loadMono(fileA,setStatus);
+    const b=await loadMono(fileB,setStatus);
+    setStatus('analyzing ...');
+    await new Promise(r=>setTimeout(r,30)); // let status paint
+    const A=logBandEnergies(a,SR), B=logBandEnergies(b,SR);
+    const dist=spectralDistance(A,B);
+    const {regions,thr}=findRegions(dist,SR);
+    const durS=Math.min(a.length,b.length)/SR;
+    const dmax=Math.max(...dist, thr*1.5, 1e-6);
+    let dn=Array.from(dist,v=>Math.min(1,v/dmax));
+    if(dn.length>2000){
+      const idx=[];
+      for(let i=0;i<2000;i++) idx.push(Math.round(i*(dn.length-1)/1999));
+      dn=idx.map(i=>dn[i]);
+    }
+    D={nameA:fileA.name,nameB:fileB.name,dur:durS,
+       envA:peakEnvelope(a.subarray(0,Math.floor(durS*SR))),
+       envB:peakEnvelope(b.subarray(0,Math.floor(durS*SR))),
+       dist:dn,regions};
+    $('audA').src=URL.createObjectURL(fileA);
+    $('audB').src=URL.createObjectURL(fileB);
+    renderReport();
+    setStatus(`done · ${regions.length} changed region${regions.length===1?'':'s'}`);
+  }catch(err){
+    setStatus('error: '+err.message+' (is this a supported audio format?)');
+  }
+  $('run').disabled=false;
+};
+
+const dpr=window.devicePixelRatio||1;
+function fmt(t){const m=Math.floor(t/60),s=(t%60).toFixed(2).padStart(5,'0');
+  return `${m}:${s}`}
+
+function drawWave(id, env, color){
+  const c=$(id), r=c.getBoundingClientRect();
+  c.width=r.width*dpr; c.height=c.getAttribute('height')*dpr;
+  const ctx=c.getContext('2d'); ctx.scale(dpr,dpr);
+  const W=r.width, H=+c.getAttribute('height'), mid=H/2;
+  ctx.fillStyle='rgba(224,96,58,.16)';
+  for(const rg of D.regions){
+    const x0=rg.start/D.dur*W, x1=rg.end/D.dur*W;
+    ctx.fillRect(x0,0,x1-x0,H);
+  }
+  ctx.strokeStyle=color; ctx.lineWidth=1; ctx.beginPath();
+  const n=env.length; let peak=.001;
+  for(const v of env) if(v>peak)peak=v;
+  for(let i=0;i<n;i++){
+    const x=i/(n-1)*W, a=env[i]/peak*(mid-6);
+    ctx.moveTo(x,mid-a); ctx.lineTo(x,mid+a+0.5);
+  }
+  ctx.stroke();
+}
+function drawDiff(){
+  const c=$('wD'), r=c.getBoundingClientRect();
+  c.width=r.width*dpr; c.height=c.getAttribute('height')*dpr;
+  const ctx=c.getContext('2d'); ctx.scale(dpr,dpr);
+  const W=r.width, H=+c.getAttribute('height');
+  const n=D.dist.length;
+  for(let i=0;i<n;i++){
+    const v=D.dist[i], x=i/n*W, w=W/n+0.5;
+    ctx.fillStyle=`rgba(224,96,58,${Math.min(1,v)})`;
+    ctx.fillRect(x,H*(1-v),w,H*v);
+  }
+}
+function renderReport(){
+  $('result').style.display='block';
+  $('labA').textContent=D.nameA; $('labB').textContent=D.nameB;
+  const cs=getComputedStyle(document.documentElement);
+  drawWave('wA',D.envA,cs.getPropertyValue('--wave-a'));
+  drawWave('wB',D.envB,cs.getPropertyValue('--wave-b'));
+  drawDiff();
+  const tb=document.querySelector('#tbl tbody');
+  tb.innerHTML='';
+  if(D.regions.length===0)
+    tb.innerHTML='<tr><td colspan="6" class="none">no meaningful differences found</td></tr>';
+  const maxPeak=Math.max(...D.regions.map(r=>r.peak),0.001);
+  D.regions.forEach((rg,i)=>{
+    const tr=document.createElement('tr');
+    tr.className='region';
+    tr.innerHTML=`<td>${i+1}</td><td>${fmt(rg.start)}</td><td>${fmt(rg.end)}</td>
+      <td>${(rg.end-rg.start).toFixed(2)}s</td>
+      <td><span class="sev" style="width:${Math.round(rg.peak/maxPeak*90)+8}px"></span></td>
+      <td style="color:var(--dim)">peak ${rg.peak}</td>`;
+    tr.onclick=()=>{loop=[rg.start,rg.end];cur.currentTime=rg.start;cur.play();};
+    tb.appendChild(tr);
+  });
+}
+addEventListener('resize',()=>{if(D)renderReport();});
+
+// transport
+const audA=$('audA'), audB=$('audB');
+let cur=audA, loop=null;
+const bA=$('playA'), bB=$('playB');
+function setSource(a){
+  const t=cur.currentTime, playing=!cur.paused;
+  cur.pause(); cur=a?audA:audB; cur.currentTime=t;
+  bA.classList.toggle('active',a); bB.classList.toggle('active',!a);
+  if(playing) cur.play();
+}
+bA.onclick=()=>{setSource(true); cur.play();};
+bB.onclick=()=>{setSource(false); cur.play();};
+$('stop').onclick=()=>{cur.pause();loop=null;};
+$('timeline').addEventListener('click',e=>{
+  if(!D)return;
+  const r=$('timeline').getBoundingClientRect();
+  const t=(e.clientX-r.left)/r.width*D.dur;
+  loop=null; cur.currentTime=Math.max(0,Math.min(D.dur,t)); cur.play();
+});
+setInterval(()=>{
+  const cursor=$('cursor');
+  if(!D||cur.paused){cursor.style.display='none';return}
+  cursor.style.display='block';
+  const r=$('timeline').getBoundingClientRect();
+  cursor.style.left=(cur.currentTime/D.dur*r.width)+'px';
+  if(loop&&cur.currentTime>=loop[1]) cur.currentTime=loop[0];
+},60);
+</script>
+</body>
+</html>
